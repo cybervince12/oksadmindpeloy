@@ -36,7 +36,7 @@ const Transactions = () => {
         let query = supabase.from('livestock').select('*').in('status', statusFilter);
 
         if (categoryFilter) {
-          query = query.eq('category', categoryFilter);
+          query = query.ilike('category', categoryFilter);
         }
 
         if (startDate) {
@@ -335,12 +335,12 @@ const Transactions = () => {
           className="border border-gray-300 p-2 rounded-lg bg-white text-gray-700 shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition duration-200"
         >
           <option value="" >Filter by Category</option>
-          <option value="sheep">Sheep</option>
-          <option value="pig">Pig</option>
-          <option value="carabao">Carabao</option>
-          <option value="cattle">Cattle</option>
-          <option value="goat">Goat</option>
-          <option value="horse">Horse</option>
+          <option value="Sheep">Sheep</option>
+          <option value="Pig">Pig</option>
+          <option value="Carabao">Carabao</option>
+          <option value="Cattle">Cattle</option>
+          <option value="Goat">Goat</option>
+          <option value="Horse">Horse</option>
     </select>
 
     <input
