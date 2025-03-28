@@ -29,29 +29,27 @@ const Transactions = () => {
           statusFilter = ['AUCTION_ENDED', 'SOLD'];
         } else if (activeTab === 'Disapproved') {
           statusFilter = ['DISAPPROVED'];
-
-      
         }
-
+  
         let query = supabase.from('livestock').select('*').in('status', statusFilter);
-
+  
         if (categoryFilter) {
-          query = query.ilike('category', categoryFilter);
+          query = query.eq('category', categoryFilter);
         }
-
+  
         if (startDate) {
           query = query.gte('auction_start', startDate);
         }
         if (endDate) {
           query = query.lte('auction_end', endDate);
         }
-
+  
         const { data, error } = await query;
         if (error) {
           console.error('Error fetching livestock:', error);
           setErrorMessage('Failed to fetch livestock. Please try again later.');
         } else {
-          // Removed the filtering based on searchQuery
+          // Sort by auction start date
           data.sort((a, b) => {
             const dateA = new Date(a.auction_start);
             const dateB = new Date(b.auction_start);
@@ -66,52 +64,309 @@ const Transactions = () => {
         setErrorMessage('An unexpected error occurred while fetching livestock.');
       }
     };
-
+  
+    // ✅ Function to automatically mark expired auctions as ended
+    const markExpiredAuctionsAsEnded = async () => {
+      try {
+        console.log('🔹 Checking for expired auctions that are still "AVAILABLE"...');
+  
+        // Fetch all auctions that are still "AVAILABLE" but have expired
+        const { data: expiredAuctions, error } = await supabase
+          .from('livestock')
+          .select('livestock_id')
+          .eq('status', 'AVAILABLE')
+          .lt('auction_end', new Date().toISOString()); // Auction should be expired
+  
+        if (error) {
+          console.error('❌ Error fetching expired auctions:', error.message);
+          return;
+        }
+  
+        if (expiredAuctions.length > 0) {
+          console.log(`⏳ Updating ${expiredAuctions.length} expired auctions to "AUCTION_ENDED"...`);
+          const { error: updateError } = await supabase
+            .from('livestock')
+            .update({ status: 'AUCTION_ENDED' })
+            .in('livestock_id', expiredAuctions.map(a => a.livestock_id));
+  
+          if (updateError) {
+            console.error('❌ Error updating expired auctions:', updateError.message);
+          } else {
+            console.log('✅ Expired auctions successfully updated to "AUCTION_ENDED".');
+          }
+        } else {
+          console.log('✅ No expired auctions found.');
+        }
+      } catch (err) {
+        console.error('❌ Unexpected error updating expired auctions:', err.message);
+      }
+    };
+  
+    // ✅ Function to remove auctions that ended with no bids
+    const removeEndedAuctions = async () => {
+      try {
+        console.log('🔹 Checking for ended auctions to remove...');
+  
+        // Fetch all auctions that have ended
+        const { data: endedAuctions, error } = await supabase
+          .from('livestock')
+          .select('livestock_id')
+          .eq('status', 'AUCTION_ENDED');
+  
+        if (error) {
+          console.error('❌ Error fetching ended auctions:', error.message);
+          return;
+        }
+  
+        // Loop through each ended auction
+        for (let auction of endedAuctions) {
+          // Check if any bids exist for the auction
+          const { data: highestBid, error: bidError } = await supabase
+            .from('bids')
+            .select('bidder_id')
+            .eq('livestock_id', auction.livestock_id)
+            .limit(1)
+            .single();
+  
+          if (bidError && bidError.code !== 'PGRST116') {
+            console.error(`❌ Error checking bids for ${auction.livestock_id}:`, bidError.message);
+            continue;
+          }
+  
+          // If no bids exist, delete the auction
+          if (!highestBid) {
+            console.log(`🗑 Deleting auction: ${auction.livestock_id}`);
+            const { error: deleteError } = await supabase
+              .from('livestock')
+              .delete()
+              .eq('livestock_id', auction.livestock_id);
+  
+            if (deleteError) {
+              console.error('❌ Error deleting auction:', deleteError.message);
+            }
+          }
+        }
+      } catch (error) {
+        console.error('❌ Error removing ended auctions:', error.message);
+      }
+    };
+  
+    // Fetch transactions and process expired auctions
     fetchTransactions();
+    markExpiredAuctionsAsEnded();
+    removeEndedAuctions();
+  
+    // Function to get current tab status filter
+    const getStatusFilter = () => {
+      if (activeTab === 'Pending') return ['PENDING'];
+      if (activeTab === 'Ongoing') return ['AVAILABLE'];
+      if (activeTab === 'Finished') return ['AUCTION_ENDED', 'SOLD'];
+      if (activeTab === 'Disapproved') return ['DISAPPROVED'];
+      return [];
+    };
+  
+    // ✅ Real-time subscription to update transactions in real-time
+    const subscription = supabase
+      .channel('livestock-realtime')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'livestock' }, async (payload) => {
+        const { eventType, new: newData, old: oldData } = payload;
+  
+        setTransactions((prevTransactions) => {
+          const statusFilter = getStatusFilter();
+  
+          if (eventType === 'INSERT') {
+            return statusFilter.includes(newData.status) ? [newData, ...prevTransactions] : prevTransactions;
+          }
+          if (eventType === 'UPDATE') {
+            if (!statusFilter.includes(newData.status)) {
+              return prevTransactions.filter((transaction) => transaction.livestock_id !== newData.livestock_id);
+            }
+            return prevTransactions.map((transaction) =>
+              transaction.livestock_id === newData.livestock_id ? newData : transaction
+            );
+          }
+          if (eventType === 'DELETE') {
+            return prevTransactions.filter((transaction) => transaction.livestock_id !== oldData.livestock_id);
+          }
+          return prevTransactions;
+        });
+  
+        // ✅ If auction is updated to "AUCTION_ENDED", attempt removal if necessary
+        if (newData.status === 'AUCTION_ENDED') {
+          await removeEndedAuctions();
+        }
+      })
+      .subscribe();
+  
+    return () => {
+      subscription.unsubscribe();
+    };
   }, [activeTab, categoryFilter, startDate, endDate, sortOrder]);
+  
 
   const handleApprove = async (id) => {
     setSelectedTransaction({ id, action: 'approve' });
     setShowConfirmModal(true);
-  };
+};
 
-  const handleDisapprove = async (id) => {
+const handleDisapprove = async (id) => {
     setSelectedTransaction({ id, action: 'disapprove' });
     setShowConfirmModal(true);
-  };
+};
 
-  const confirmAction = async () => {
-    try {
+const confirmAction = async () => {
+  try {
+      console.log(`🔹 Confirming action: ${selectedTransaction.action} for ${selectedTransaction.id}`);
+
       const updatedStatus = selectedTransaction.action === 'approve' ? 'AVAILABLE' : 'DISAPPROVED';
-      const { error } = await supabase
-        .from('livestock')
-        .update({ status: updatedStatus })
-        .eq('livestock_id', selectedTransaction.id);
 
-      if (error) {
-        console.error('Error updating livestock:', error);
-        setErrorMessage('Failed to update livestock. Please try again.');
-      } else {
-        setTransactions(
-          transactions.map((transaction) =>
-            transaction.livestock_id === selectedTransaction.id
+      // ✅ Update livestock status
+      const { error } = await supabase
+          .from('livestock')
+          .update({ status: updatedStatus })
+          .eq('livestock_id', selectedTransaction.id);
+
+      if (error) throw error;
+      console.log(`✅ Livestock ${selectedTransaction.id} updated to ${updatedStatus}`);
+
+      setTransactions(transactions.map(transaction =>
+          transaction.livestock_id === selectedTransaction.id
               ? { ...transaction, status: updatedStatus }
               : transaction
-          )
-        );
-        setShowConfirmModal(false);
-        setSelectedTransaction(null);
-      }
-    } catch (error) {
-      console.error('Unexpected error during approval/disapproval:', error);
-      setErrorMessage('An unexpected error occurred while updating livestock.');
-    }
-  };
+      ));
 
-  const cancelAction = () => {
+      // ✅ Fetch seller ID
+      const { data: livestockData, error: sellerError } = await supabase
+          .from('livestock')
+          .select('owner_id, category')
+          .eq('livestock_id', selectedTransaction.id)
+          .single();
+
+      if (sellerError || !livestockData?.owner_id) {
+          console.error('❌ Error fetching seller:', sellerError?.message);
+          return;
+      }
+
+      const sellerId = livestockData.owner_id;
+      const category = livestockData.category;
+
+      console.log(`✅ Seller ID: ${sellerId}, Category: ${category}`);
+
+      // ✅ Send notifications
+      if (updatedStatus === 'AVAILABLE') {
+          console.log(`🔹 Triggering NEW_AUCTION notification for ${selectedTransaction.id}`);
+          await handleNewAuctionNotification(selectedTransaction.id, category, sellerId); // Notify everyone except seller
+          await sendNotificationToSeller(selectedTransaction.id, sellerId, 'AUCTION_APPROVED', 'Your auction has been approved and is now live!');
+      } else {
+          await sendNotificationToSeller(selectedTransaction.id, sellerId, 'AUCTION_DISAPPROVED', 'Your auction has been disapproved.');
+      }
+
+      setShowConfirmModal(false);
+      setSelectedTransaction(null);
+  } catch (error) {
+      console.error('❌ Unexpected error during approval/disapproval:', error);
+  }
+};
+
+
+const handleNewAuctionNotification = async (livestockId, category, sellerId) => {
+  try {
+      console.log(`🔹 Starting NEW_AUCTION notification for livestock: ${livestockId}`);
+
+      // ✅ Fetch all users EXCEPT the seller from 'profiles'
+      const { data: users, error: userError } = await supabase
+          .from('profiles')  // ✅ Use 'profiles' table instead of 'users'
+          .select('id')
+          .neq('id', sellerId); // Exclude seller
+
+      if (userError) throw userError;
+      if (!users || users.length === 0) {
+          console.warn("⚠ No users found for NEW_AUCTION notification.");
+          return;
+      }
+      console.log('✅ Users to notify (excluding seller):', users.map(u => u.id));
+
+      // ✅ Insert notification in `notifications` table
+      const { data: insertedNotif, error: notifError } = await supabase
+          .from('notifications')
+          .insert([{
+              livestock_id: livestockId,
+              seller_id: null, // No seller since this is for all bidders
+              message: `A new auction for ${category} is now live! Place your bids now.`,
+              notification_type: 'NEW_AUCTION',
+              is_read: false,
+              created_at: new Date().toISOString(),
+          }])
+          .select()
+          .single(); // Retrieve inserted notification
+
+      if (notifError) throw notifError;
+      if (!insertedNotif || !insertedNotif.id) {
+          console.error("❌ Failed to insert NEW_AUCTION notification.");
+          return;
+      }
+
+      console.log('✅ NEW_AUCTION notification created with ID:', insertedNotif.id);
+
+      // ✅ Insert notifications for all users (except the seller) in `notification_bidders`
+      const notifications = users.map(user => ({
+          notification_id: insertedNotif.id, // Link to main notification
+          bidder_id: user.id, // Notify only non-sellers
+          notification_type: 'NEW_AUCTION',
+          is_read: false,
+          created_at: new Date().toISOString(),
+      }));
+
+      console.log('📌 Inserting notifications for:', notifications);
+
+      const { error: insertError } = await supabase
+          .from('notification_bidders')
+          .insert(notifications);
+
+      if (insertError) throw insertError;
+
+      console.log('✅ NEW_AUCTION notifications successfully sent to all bidders (excluding seller).');
+
+  } catch (err) {
+      console.error('❌ Error sending NEW_AUCTION notification:', err.message);
+  }
+};
+
+
+
+
+const sendNotificationToSeller = async (livestockId, sellerId, type, message) => {
+  try {
+      console.log(`🔹 Sending ${type} notification for livestock: ${livestockId}`);
+
+      // ✅ Insert notification for seller
+      const { error } = await supabase.from('notifications').insert([
+          {
+              livestock_id: livestockId,
+              seller_id: sellerId, // ✅ Ensure seller_id is stored
+              message: message,
+              notification_type: type,
+              is_read: false,
+              created_at: new Date().toISOString(),
+          },
+      ]);
+
+      if (error) {
+          console.error(`❌ Error sending ${type} notification to seller:`, error.message);
+      } else {
+          console.log(`✅ ${type} notification sent to seller (${sellerId}).`);
+      }
+  } catch (err) {
+      console.error(`❌ Unexpected error in ${type} notification:`, err.message);
+  }
+};
+
+
+const cancelAction = () => {
     setShowConfirmModal(false);
     setSelectedTransaction(null);
-  };
+};
+
 
   const renderTransactions = () => {
     const startIndex = (currentPage - 1) * pageLimit;
@@ -127,14 +382,12 @@ const Transactions = () => {
         className={`border-t hover:bg-gray-100 ${index % 2 === 0 ? 'bg-white' : 'bg-gray-50'}`}
       > 
         <td className="p-3 text-sm">{index + 1}</td>
-        <td className="p-3 text-sm">{transaction.livestock_id}</td>
         <td className="p-3 text-sm">{transaction.category}</td>
         <td className="p-3 text-sm">{transaction.breed}</td>
         <td className="p-3 text-sm">{transaction.age}</td>
         <td className="p-3 text-sm">{transaction.gender}</td>
         <td className="p-3 text-sm">{transaction.weight}kg</td>
         <td className="p-3 text-sm">P{transaction.starting_price}</td>
-        <td className="p-3 text-sm">{transaction.current_bid}</td>
         <td className="p-3 text-sm">
           {format(new Date(transaction.auction_start), 'MM/dd/yyyy hh:mm a')}
         </td>
@@ -143,7 +396,7 @@ const Transactions = () => {
         </td>
         <td className="p-3 text-sm">
         <span
-  className={`py-2 px-4 rounded text-sm font-semibold inline-flex items-center ${
+  className={`py-1 px-3 rounded-full text-sm font-semibold inline-flex items-center ${
     transaction.status === 'AVAILABLE'
       ? 'bg-green-600 text-white'
       : transaction.status === 'PENDING'
@@ -273,7 +526,7 @@ const Transactions = () => {
 
   return (
     <>
-      <TopHeader title="Transaction Reports" />
+      <TopHeader title="Transactions" />
       <div className="container mx-auto p-4">
         {errorMessage && (
           <div className="text-red-500 text-center p-2 border border-red-500 mb-4">
@@ -335,12 +588,12 @@ const Transactions = () => {
           className="border border-gray-300 p-2 rounded-lg bg-white text-gray-700 shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition duration-200"
         >
           <option value="" >Filter by Category</option>
-          <option value="Sheep">Sheep</option>
-          <option value="Pig">Pig</option>
-          <option value="Carabao">Carabao</option>
-          <option value="Cattle">Cattle</option>
-          <option value="Goat">Goat</option>
-          <option value="Horse">Horse</option>
+          <option value="sheep">Sheep</option>
+          <option value="pig">Pig</option>
+          <option value="carabao">Carabao</option>
+          <option value="cattle">Cattle</option>
+          <option value="goat">Goat</option>
+          <option value="horse">Horse</option>
     </select>
 
     <input
@@ -362,14 +615,12 @@ const Transactions = () => {
   <thead>
     <tr>
       <th className="p-1 text-xs text-white bg-green-800">#</th>
-      <th className="p-1 text-xs text-white bg-green-800">ID</th>
       <th className="p-1 text-xs text-white bg-green-800">Category</th>
       <th className="p-1 text-xs text-white bg-green-800">Breed</th>
       <th className="p-1 text-xs text-white bg-green-800">Age</th>
       <th className="p-1 text-xs text-white bg-green-800">Gender</th>
       <th className="p-1 text-xs text-white bg-green-800">Weight</th>
       <th className="p-1 text-xs text-white bg-green-800">Starting Price</th>
-      <th className="p-1 text-xs text-white bg-green-800">Current Bid</th>
       <th className="p-1 text-xs text-white bg-green-800">Auction Start</th>
       <th className="p-1 text-xs text-white bg-green-800">Auction End</th>
       <th className="p-1 text-xs text-white bg-green-800">Status</th>
